@@ -5,6 +5,17 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      push-to-ghcr:
+        description: '是否推送到 GHCR'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   build_and_test:
@@ -12,7 +23,7 @@ jobs:
 
     strategy:
       matrix:
-        node-version: [20.x] # 仅保留 Node 20, 移除 18.x
+        node-version: [20.x]
 
     steps:
     - name: Checkout code
@@ -27,16 +38,53 @@ jobs:
     - name: Install dependencies
       run: npm ci
 
+    - name: Run tests
+      run: npm test --if-present
+
+    # ---------- Docker 构建 & 推送到 GHCR ----------
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
-    - name: Build Docker image
+    # 判断是否需要登录：main 分支推送 或 手动触发且选择了推送
+    - name: Decide login condition
+      id: login_condition
+      run: |
+        if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+          echo "should_login=true" >> $GITHUB_OUTPUT
+        elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.push-to-ghcr }}" == "true" ]]; then
+          echo "should_login=true" >> $GITHUB_OUTPUT
+        else
+          echo "should_login=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Log in to GitHub Container Registry
+      if: steps.login_condition.outputs.should_login == 'true'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Docker meta
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ghcr.io/lioensky/vcptoolbox
+        tags: |
+          type=raw,value=latest,enable={{is_default_branch}}
+          type=sha,prefix=,format=short
+
+    - name: Build and push Docker image
       uses: docker/build-push-action@v5
       with:
         context: .
         file: ./Dockerfile
-        push: false # 在 PR 检查和 main 分支构建时不推送镜像
-        tags: lioensky/vcptoolbox:latest # 替换为您的 Docker Hub 用户名/组织名和镜像名
+        push: ${{ steps.login_condition.outputs.should_login == 'true' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        platforms: linux/amd64,linux/arm64
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
